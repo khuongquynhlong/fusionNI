@@ -1,5 +1,5 @@
 library(tidyverse)
-library(survey)
+# library(survey)
 library(doParallel)
 library(foreach)
 
@@ -61,38 +61,12 @@ sim_data <- function(n1, n2, seed = NULL) {
 }
 
 
-
 #----- Weight generating function
 #===============================================================================
-gen_weight <- function(data) {
-  # W_a = P(A = a|X, S=d)
-  distal_data <- subset(data, S == 0)
-  a_mod       <- glm(A ~ X1 + X2, family = "binomial", data = distal_data)
-  a_pred      <- predict(a_mod, newdata = data, type = "response")
-  w_a         <- 1/a_pred
-  
-  # W_trans
-  s_mod       <- glm(S ~ X1 + X2, family = "binomial", data = data)
-  s_pred      <- predict(s_mod, type = "response")
-  w_trans     <- s_pred/(1-s_pred)
-  w_trial     <-  (1 - mean(data$S))/mean(data$S)
-  w_2t        <- w_trans*w_trial
-  
-  # All components
-  w_all        <- w_a*w_2t
-  data$w_trans <- w_trans
-  data$w_2t    <- w_2t
-  data$w_all   <- w_all
-  
-  return(data)
-}
-
-
-# Simplified weights: this is sufficient
-gen_weight_s <- function(data) {
+gen_weight     <- function(data) {
   s_mod        <- glm(S ~ X1 + X2, family = "binomial", data = data)
   s_pred       <- predict(s_mod, type = "response")
-  w_trial      <- s_pred/(1-s_pred)
+  w_trans      <- s_pred/(1-s_pred)
   data$w_trans <- w_trans
   
   return(data)
@@ -103,7 +77,7 @@ gen_weight_s <- function(data) {
 #----- Fusion estimator
 #===============================================================================
 
-#----- Estimates from local and distal trials separately
+#----- Estimates from local and distal trials
 trial_est <- function(data){
   Y12 <- data[data$S == 1 & data$A == 2, ]$Y
   Y11 <- data[data$S == 1 & data$A == 1, ]$Y
@@ -150,29 +124,26 @@ trial_est <- function(data){
 
 #----- Estimates by transporting distal to local (psi_trans)
 trans_est <- function(data){
-  dataS0     <- subset(data, S == 0)
-  # Applying the weight
-  Y1w_mod    <- svyglm(Y ~ A, family = "quasibinomial", 
-                       design = svydesign(~ 1, weights = ~dataS0$w_trans, data = dataS0))
-  pY1        <- predict(Y1w_mod, newdata = data.frame(A = 1), type = "response") 
-  pY0        <- predict(Y1w_mod, newdata = data.frame(A = 0), type = "response") 
+  dataS0_A0  <- subset(data, S == 0 & A == 0)
+  dataS0_A1  <- subset(data, S == 0 & A == 1)
   
-  psi_trans1 <- mean(pY1)
-  psi_trans0 <- mean(pY0)
+  # Estimates: Hájek estimator
+  psi_trans0 <- sum(dataS0_A0$w_trans*dataS0_A0$Y)/sum(dataS0_A0$w_trans)
+  psi_trans1 <- sum(dataS0_A1$w_trans*dataS0_A1$Y)/sum(dataS0_A1$w_trans)
+  
   psi_trans  <- psi_trans1 - psi_trans0
   
-  # SE
-  # `svyglm` always returns robust standard errors
-  # ~ equivalent to se via influence function
-  se_psi_trans1 <- as.numeric(SE(pY1))
-  se_psi_trans0 <- as.numeric(SE(pY0))
-  se_psi_trans  <- sqrt(se_psi_trans1^2 + se_psi_trans0^2)
+  # Sandwich variance
+  var_psi_trans0 <- sum((dataS0_A0$w_tran*(dataS0_A0$Y - psi_trans0))^2)/(sum(dataS0_A0$w_tran))^2
+  var_psi_trans1 <- sum((dataS0_A1$w_tran*(dataS0_A1$Y - psi_trans1))^2)/(sum(dataS0_A1$w_tran))^2
+  
+  se_psi_trans   <- sqrt(var_psi_trans0 + var_psi_trans1)
   
   est_list   <- list(psi_trans0    = psi_trans0,
                      psi_trans1    = psi_trans1, 
                      psi_trans     = psi_trans,
-                     se_psi_trans1 = se_psi_trans1,
-                     se_psi_trans0 = se_psi_trans0,
+                     se_psi_trans1 = sqrt(var_psi_trans1),
+                     se_psi_trans0 = sqrt(var_psi_trans0),
                      se_psi_trans  = se_psi_trans)
   return(est_list)
 }
@@ -184,7 +155,7 @@ trans_est <- function(data){
 #===============================================================================
 sim_combine <- function(data){
   
-  dataS1      <- subset(data, S == 1)
+  dataS1        <- subset(data, S == 1)
   
   # True values
   true_Y2       <- mean(dataS1$Y2)
@@ -220,6 +191,8 @@ sim_combine <- function(data){
                               se_psi_crude  = se_psi_crude)
   return(est_list)
 }
+
+
 
 
 
@@ -267,8 +240,11 @@ sim_boot <- function(B, data) {
 
 
 
+
+
+
 #===============================================================================
-#------------------------------- Run simulation -------------------------------- 
+#----------------------- Run simulation: Estimates + SE ------------------------ 
 #===============================================================================
 
 num_cores <- parallel::detectCores() - 4
@@ -298,18 +274,17 @@ for (j in 1:nrow(param_grid)) {
   n2 <- param_grid$n2[j]
   
   # Parallel loop for iterations for current parameter combination
-  sim_results <- foreach(i = 1:iterations, .combine = rbind, 
-                         .packages = c("survey")) %dopar% {
-                           df <- sim_data(n1 = n1, n2 = n2) |> gen_weight()
-                           # Compute estimates 
-                           sim_result <- sim_combine(df)
-                           # Append simulation parameters
-                           sim_result$n1   <- n1
-                           sim_result$n2   <- n2
-                           sim_result$iter <- i
-                           # Return
-                           sim_result 
-                         }
+  sim_results <- foreach(i = 1:iterations, .combine = rbind) %dopar% {
+    df <- sim_data(n1 = n1, n2 = n2) |> gen_weight()
+    # Compute estimates 
+    sim_result <- sim_combine(df)
+    # Append simulation parameters
+    sim_result$n1   <- n1
+    sim_result$n2   <- n2
+    sim_result$iter <- i
+    # Return
+    sim_result 
+  }
   
   results_list[[j]] <- sim_results
 }
@@ -323,8 +298,6 @@ end_time <- Sys.time()
 runtime <- end_time - start_time
 runtime
 
-
-# saveRDS(result_tab, "Example2_est.RDS")
 
 # Probability scale
 result_sum <- result_tab |>
@@ -344,7 +317,6 @@ result_sum <- result_tab |>
     crude_mce     = sd(bias_crude)
   ) |> mutate_all(function(x){x = round(x, 4)})
 
-# writexl::write_xlsx(result_sum, "result_sum.xlsx")
 
 
 
@@ -379,14 +351,14 @@ set.seed(12345)
 
 # Parallel loop
 coverage_results <- foreach(i = 1:nrow(param_grid), .combine = rbind, 
-                            .packages = c("survey", "dplyr")) %dopar% {
+                            .packages = c("dplyr")) %dopar% {
                               
                               n1 <- param_grid$n1[i]
                               n2 <- param_grid$n2[i]
                               true_fusion <- param_grid$true_fusion[i]
                               
                               cover_fusion  <- 0
-                              cover_crude  <- 0
+                              cover_crude   <- 0
                               
                               # Run MC replicates for this combination
                               for (j in 1:MC) {
@@ -433,9 +405,7 @@ end_time <- Sys.time()
 runtime <- end_time - start_time
 runtime
 
-
-saveRDS(coverage_results, "coverage_results.RDS")
-
+coverage_results <- coverage_results |> mutate_all(function(x){x = round(x, 4)})
 
 
 
@@ -456,14 +426,14 @@ param_grid <- result_tab |>
   ungroup()
 
 # Number of Monte Carlo replicates
-MC <- 90
+MC <- 200
 
 cl <- makeCluster(detectCores() - 4)
 registerDoParallel(cl)
 
 start_time <- Sys.time()
 
-set.seed(12345)
+# set.seed(12345)
 
 results_boot_se <- foreach(i = 1:nrow(param_grid), .combine = rbind,
                            .packages = c("survey", "dplyr")) %dopar% {
@@ -502,8 +472,8 @@ end_time <- Sys.time()
 runtime <- end_time - start_time
 runtime
 
-
-saveRDS(results_boot_se, "results_boot_se100.RDS")
+results_boot_se <- results_boot_se |> group_by(n1, n2) |>
+  summarise(boot_se_fusion_ave = mean(boot_se_fusion)) |> mutate_all(function(x){x = round(x, 4)})
 
 
 
@@ -576,4 +546,5 @@ end_time <- Sys.time()
 runtime <- end_time - start_time
 runtime
 
-saveRDS(boot_results, "boot_results.RDS")
+boot_results <- boot_results |> mutate_all(function(x){x = round(x, 4)})
+
