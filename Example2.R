@@ -1,5 +1,5 @@
 library(tidyverse)
-# library(survey)
+library(geex)
 library(doParallel)
 library(foreach)
 
@@ -68,6 +68,7 @@ gen_weight     <- function(data) {
   s_pred       <- predict(s_mod, type = "response")
   w_trans      <- s_pred/(1-s_pred)
   data$w_trans <- w_trans
+  data$s_pred  <- s_pred
   
   return(data)
 }
@@ -122,8 +123,14 @@ trial_est <- function(data){
 
 
 
-#----- Estimates by transporting distal to local (psi_trans)
+
+
+
+#----- Estimates by transporting distal to local (psi_trans): estimate only (for boostrap)
+
 trans_est <- function(data){
+  
+  data <- data |> gen_weight()
   dataS0_A0  <- subset(data, S == 0 & A == 0)
   dataS0_A1  <- subset(data, S == 0 & A == 1)
   
@@ -133,21 +140,89 @@ trans_est <- function(data){
   
   psi_trans  <- psi_trans1 - psi_trans0
   
-  # Sandwich variance
-  var_psi_trans0 <- sum((dataS0_A0$w_tran*(dataS0_A0$Y - psi_trans0))^2)/(sum(dataS0_A0$w_tran))^2
-  var_psi_trans1 <- sum((dataS0_A1$w_tran*(dataS0_A1$Y - psi_trans1))^2)/(sum(dataS0_A1$w_tran))^2
-  
-  se_psi_trans   <- sqrt(var_psi_trans0 + var_psi_trans1)
-  
   est_list   <- list(psi_trans0    = psi_trans0,
                      psi_trans1    = psi_trans1, 
-                     psi_trans     = psi_trans,
-                     se_psi_trans1 = sqrt(var_psi_trans1),
-                     se_psi_trans0 = sqrt(var_psi_trans0),
-                     se_psi_trans  = se_psi_trans)
+                     psi_trans     = psi_trans)
   return(est_list)
 }
 
+
+
+
+
+trans_Mest <- function(data) {
+  
+  fit_S <- glm(S ~ X1 + X2, family = binomial, data = data)
+  
+  data <- data |>
+    mutate(
+      pSl_X  = predict(fit_S, type = "response"),
+      Wtrans = pSl_X / (1 - pSl_X),
+      S_dist = 1 - S  # 1 = distal (S==0)
+    )
+  
+  
+  estimate_arm <- function(a, data_set){
+    
+    ## ----- outer(data) returns inner(theta) 
+    
+    estFUN <- function(data) {
+      
+      xvec   <- c(1, data$X1, data$X2)
+      Sdist  <- data$S_dist
+      S_val  <- data$S
+      A_val  <- data$A
+      Y_val  <- data$Y
+      
+      function(theta) {
+        ## theta = (psi , β0 , β1 , β2)
+        psi  <- theta[1]
+        beta <- theta[2:4]
+        
+        pSl <- plogis(sum(xvec * beta))
+        w   <- pSl / (1 - pSl)
+        
+        ## stacked score: length 1 + 3 = 4
+        u_psi  <- Sdist * (A_val == a) * w * (Y_val - psi)
+        u_beta <- (S_val - pSl) * xvec
+        c(u_psi, u_beta)
+      }
+    }
+    
+    ## starting values
+    psi_start <- with(data_set, mean(Y[S_dist == 1 & A == a], na.rm = TRUE))
+    theta0    <- c(psi_start, coef(fit_S)) 
+    
+    gee_out <- m_estimate(
+      estFUN = estFUN,
+      data   = data_set,
+      root_control = setup_root_control(start = theta0)
+    )
+    
+    psi_hat <- coef(gee_out)[1]
+    se_hat  <- sqrt(vcov(gee_out)[1, 1])
+    
+    tibble(
+      A        = a,
+      Estimate = psi_hat,
+      SE       = se_hat
+    )
+  }
+
+  result <- bind_rows(lapply(0:1, estimate_arm, data_set = data))
+  
+  est_list   <- list(psi_trans0    = result$Estimate[1],
+                     psi_trans1    = result$Estimate[2], 
+                     psi_trans     = result$Estimate[2] - result$Estimate[1],
+                     se_psi_trans0 = result$SE[1],
+                     se_psi_trans1 = result$SE[2],
+                     se_psi_trans  = sqrt((result$SE[1])^2 + (result$SE[2])^2))
+  return(est_list)
+  
+}
+
+# trans_est(df)
+# trans_Mest(df)
 
 
 
@@ -164,7 +239,7 @@ sim_combine <- function(data){
   
   # Estimates
   trial_list    <- trial_est(data)
-  trans_list    <- trans_est(data)
+  trans_list    <- trans_Mest(data)
   
   # Fusion estimate
   psi_fusion    <- trans_list$psi_trans - trial_list$psi_local
@@ -193,6 +268,43 @@ sim_combine <- function(data){
 }
 
 
+
+
+# For bootstrap --> no need to calculate sandwich SE
+sim_combine_boot <- function(data){
+
+  dataS1        <- subset(data, S == 1)
+  
+  # True values
+  true_Y2       <- mean(dataS1$Y2)
+  true_Y0       <- mean(dataS1$Y0)
+  true_fusion   <- true_Y2 - true_Y0
+  
+  # Estimates
+  trial_list    <- trial_est(data)
+  trans_list    <- trans_est(data)
+  
+  # Fusion estimate
+  psi_fusion    <- trans_list$psi_trans - trial_list$psi_local
+  
+  # Crude estimate 
+  psi_crude     <- trial_list$psi_local2 - trial_list$psi_distal0
+  
+  # Difference between distal and trans for active control (A = 1)
+  C_diff        <- trans_list$psi_trans1 - trial_list$psi_distal1
+  
+  # Bias: absolute
+  bias_fusion   <- true_fusion - psi_fusion
+  bias_crude    <- true_fusion - psi_crude
+  
+  est_list      <- data.frame(true_fusion   = true_fusion,
+                              psi_fusion    = psi_fusion, 
+                              psi_crude     = psi_crude,
+                              C_diff        = C_diff,
+                              bias_fusion   = bias_fusion,
+                              bias_crude    = bias_crude)
+  return(est_list)
+}
 
 
 
@@ -226,7 +338,7 @@ sim_boot <- function(B, data) {
     data_boot <- rbind(dataS1A2_b, dataS1A1_b, dataS0A1_b, dataS0A0_b)
     
     # Calculate estimates on the bootstrap sample
-    temp_result <- sim_combine(data_boot)
+    temp_result <- sim_combine_boot(data_boot)
     
     # Store the result
     boot_results[[i]] <- temp_result
@@ -255,7 +367,7 @@ registerDoParallel(cl)
 # Define simulation grid parameters
 n1_vals    <- c(200, 500, 1000, 2000)
 n2_vals    <- c(200, 500, 1000, 2000)
-iterations <- 10000
+iterations <- 2000
 
 # Create a grid of parameter combinations
 param_grid <- expand.grid(n1 = n1_vals, n2 = n2_vals)
@@ -274,8 +386,9 @@ for (j in 1:nrow(param_grid)) {
   n2 <- param_grid$n2[j]
   
   # Parallel loop for iterations for current parameter combination
-  sim_results <- foreach(i = 1:iterations, .combine = rbind) %dopar% {
-    df <- sim_data(n1 = n1, n2 = n2) |> gen_weight()
+  sim_results <- foreach(i = 1:iterations, .combine = rbind, 
+                         .packages = c("dplyr", "geex")) %dopar% {
+    df <- sim_data(n1 = n1, n2 = n2) 
     # Compute estimates 
     sim_result <- sim_combine(df)
     # Append simulation parameters
@@ -298,6 +411,8 @@ end_time <- Sys.time()
 runtime <- end_time - start_time
 runtime
 
+
+# saveRDS(result_tab, "Example2_est.RDS")
 
 # Probability scale
 result_sum <- result_tab |>
@@ -340,9 +455,9 @@ param_grid <- result_tab |>
   ungroup()
 
 # Number of Monte Carlo replicates
-MC <- 10000
+MC <- 2000
 
-cl <- makeCluster(detectCores() - 1)
+cl <- makeCluster(detectCores() - 2)
 registerDoParallel(cl)
 
 start_time <- Sys.time()
@@ -351,7 +466,7 @@ set.seed(12345)
 
 # Parallel loop
 coverage_results <- foreach(i = 1:nrow(param_grid), .combine = rbind, 
-                            .packages = c("dplyr")) %dopar% {
+                            .packages = c("dplyr", "geex")) %dopar% {
                               
                               n1 <- param_grid$n1[i]
                               n2 <- param_grid$n2[i]
@@ -363,7 +478,7 @@ coverage_results <- foreach(i = 1:nrow(param_grid), .combine = rbind,
                               # Run MC replicates for this combination
                               for (j in 1:MC) {
                                 # Simulate data and generate weights
-                                data_sim <- sim_data(n1 = n1, n2 = n2) |> gen_weight()
+                                data_sim <- sim_data(n1 = n1, n2 = n2)
                                 
                                 sim_re <- sim_combine(data_sim)
                                 
@@ -409,7 +524,8 @@ coverage_results <- coverage_results |> mutate_all(function(x){x = round(x, 4)})
 
 
 
-
+# saveRDS(coverage_results, "coverage_results.RDS")
+writexl::write_xlsx(coverage_results, "coverage_results.xlsx")
 
 
 
@@ -426,7 +542,7 @@ param_grid <- result_tab |>
   ungroup()
 
 # Number of Monte Carlo replicates
-MC <- 200
+MC <- 1000
 
 cl <- makeCluster(detectCores() - 4)
 registerDoParallel(cl)
@@ -444,11 +560,11 @@ results_boot_se <- foreach(i = 1:nrow(param_grid), .combine = rbind,
                              boot_se_crude  <- numeric(MC)
                              
                              for (j in 1:MC) {
-                               # Simulate data and generate weights
-                               data_sim <- sim_data(n1 = n1, n2 = n2) |> gen_weight()
+                               # Simulate data 
+                               data_sim <- sim_data(n1 = n1, n2 = n2)
                                
                                # Run the bootstrap procedure 
-                               boot_re <- sim_boot(B = 2000, data = data_sim)
+                               boot_re <- sim_boot(B = 1000, data = data_sim)
                                
                                boot_se_fusion[j] <- sd(boot_re$psi_fusion)
                                boot_se_crude[j]  <- sd(boot_re$psi_crude)
@@ -456,7 +572,7 @@ results_boot_se <- foreach(i = 1:nrow(param_grid), .combine = rbind,
                              
                              # Compute the average bootstrap SE for the current (n1, n2) combination
                              boot_se_fusion_ave <- mean(boot_se_fusion)
-                             boot_se_crude_ave <- mean(boot_se_crude)
+                             boot_se_crude_ave  <- mean(boot_se_crude)
                              
                              # Return a data frame row with the sample sizes and average bootstrap SE
                              data.frame(n1 = n1, n2 = n2, 
@@ -477,74 +593,11 @@ results_boot_se <- results_boot_se |> group_by(n1, n2) |>
 
 
 
-
-
-
-#----- Compare 95%CI: Supplemental Table 1
-#===============================================================================
-n1_values <- c(200, 500, 1000, 2000)
-n2_values <- c(200, 500, 1000, 2000)
-param_grid <- expand.grid(n1 = n1_values, n2 = n2_values)
-
-cl <- makeCluster(detectCores() - 2)
-registerDoParallel(cl)
-
-start_time <- Sys.time()
-
-set.seed(12345)
-# Parallel loop over each parameter combination
-boot_results <- foreach(i = 1:nrow(param_grid), .combine = rbind, 
-                        .packages = c("survey", "dplyr")) %dopar% {
-                          n1 <- param_grid$n1[i]
-                          n2 <- param_grid$n2[i]
-                          
-                          data_sim <- sim_data(n1 = n1, n2 = n2) |> gen_weight()
-                          
-                          # Obtain the combined estimates
-                          sim_re <- sim_combine(data_sim)
-                          
-                          # Perform the bootstrap
-                          boot_re <- sim_boot(B = 5000, data = data_sim)
-                          
-                          # Asymptotic 95%CI
-                          fusion_asymp_lower <- sim_re$psi_fusion - 1.96 * sim_re$se_psi_fusion
-                          fusion_asymp_upper <- sim_re$psi_fusion + 1.96 * sim_re$se_psi_fusion
-                          
-                          crude_asymp_lower <- sim_re$psi_crude - 1.96 * sim_re$se_psi_crude
-                          crude_asymp_upper <- sim_re$psi_crude + 1.96 * sim_re$se_psi_crude
-                          
-                          # Bootstrap 95%CI
-                          fusion_boot_CI <- quantile(boot_re$psi_fusion, probs = c(0.025, 0.975))
-                          crude_boot_CI  <- quantile(boot_re$psi_crude, probs = c(0.025, 0.975))
-                          
-                          re_list <- data.frame(
-                            n1 = n1,
-                            n2 = n2,
-                            psi_fusion         = sim_re$psi_fusion,
-                            fusion_asymp_se    = sim_re$se_psi_fusion,
-                            fusion_asymp_lower = fusion_asymp_lower,
-                            fusion_asymp_upper = fusion_asymp_upper,
-                            fusion_boot_se     = sd(boot_re$psi_fusion),
-                            fusion_boot_lower  = fusion_boot_CI[1],
-                            fusion_boot_upper  = fusion_boot_CI[2],
-                            psi_crude          = sim_re$psi_crude,
-                            crude_asymp_se     = sim_re$se_psi_crude,
-                            crude_asymp_lower  = crude_asymp_lower,
-                            crude_asymp_upper  = crude_asymp_upper,
-                            crude_boot_se      = sd(boot_re$psi_crude),
-                            crude_boot_lower   = crude_boot_CI[1],
-                            crude_boot_upper   = crude_boot_CI[2]
-                          )
-                          
-                          return(re_list)
-                        }
-
-stopCluster(cl)
-
-# Runtime
-end_time <- Sys.time()
-runtime <- end_time - start_time
-runtime
-
-boot_results <- boot_results |> mutate_all(function(x){x = round(x, 4)})
+saveRDS(results_boot_se, "results_boot_se1000.RDS")
+# results_boot_se <- readRDS("results_boot_se1000.RDS")
+# 
+# results_boot_se <- results_boot_se |> group_by(n1, n2) |>
+#   summarise(boot_se_fusion_ave = mean(boot_se_fusion)) |> mutate_all(function(x){x = round(x, 4)})
+# 
+writexl::write_xlsx(results_boot_se, "results_boot_se.xlsx")
 
