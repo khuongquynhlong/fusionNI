@@ -221,8 +221,7 @@ trans_Mest <- function(data) {
   
 }
 
-# trans_est(df)
-# trans_Mest(df)
+
 
 
 
@@ -520,16 +519,10 @@ end_time <- Sys.time()
 runtime <- end_time - start_time
 runtime
 
-coverage_results <- coverage_results |> mutate_all(function(x){x = round(x, 4)})
 
 
 
-# saveRDS(coverage_results, "coverage_results.RDS")
-writexl::write_xlsx(coverage_results, "coverage_results.xlsx")
-
-
-
-#----- Bootstrap SE: averaged over 10,000 runs
+#----- Bootstrap SE: averaged over 2000 runs
 #===============================================================================
 result_tab <- readRDS("Example2_est.RDS")
 
@@ -542,7 +535,7 @@ param_grid <- result_tab |>
   ungroup()
 
 # Number of Monte Carlo replicates
-MC <- 1000
+MC <- 2000
 
 cl <- makeCluster(detectCores() - 4)
 registerDoParallel(cl)
@@ -589,15 +582,8 @@ runtime <- end_time - start_time
 runtime
 
 results_boot_se <- results_boot_se |> group_by(n1, n2) |>
-  summarise(boot_se_fusion_ave = mean(boot_se_fusion)) |> mutate_all(function(x){x = round(x, 4)})
+  summarise(boot_se_fusion_ave = mean(boot_se_fusion)) |> 
+  mutate_all(function(x){x = round(x, 4)})
 
-
-
-saveRDS(results_boot_se, "results_boot_se1000.RDS")
-# results_boot_se <- readRDS("results_boot_se1000.RDS")
-# 
-# results_boot_se <- results_boot_se |> group_by(n1, n2) |>
-#   summarise(boot_se_fusion_ave = mean(boot_se_fusion)) |> mutate_all(function(x){x = round(x, 4)})
-# 
-writexl::write_xlsx(results_boot_se, "results_boot_se.xlsx")
+results_boot_se
 
